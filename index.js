@@ -26,7 +26,7 @@ const supabase = createClient(
 // CONSTANTS
 // ─────────────────────────────────────────────
 const AFFILIATE_ID = "208330";
-const SNAPSHOT_DATE = "1970-01-01"; // lifetime row
+const SNAPSHOT_DATE = "2026-01-04"; // lifetime row
 const SPARK_ID_REGEX = /^SPK-[A-Z0-9]{4}-[A-Z0-9]{4}$/i;
 
 // ─────────────────────────────────────────────
