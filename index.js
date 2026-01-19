@@ -170,15 +170,37 @@ async function run() {
     })
   );
 
-  const { error } = await supabase
+  // ─────────────────────────────────────────────
+  // MERGE FIX (ONLY CHANGE)
+  // ─────────────────────────────────────────────
+
+  // Step 1: Ensure row exists (insert if missing)
+  await supabase
     .from("cake_earnings_daily")
-    .upsert(rowsToUpsert, {
-      onConflict: "cake_affiliate_id,date",
-    });
+    .upsert(
+      rowsToUpsert.map(r => ({
+        cake_affiliate_id: r.cake_affiliate_id,
+        date: r.date,
+      })),
+      { onConflict: "cake_affiliate_id,date" }
+    );
 
-  if (error) throw error;
+  // Step 2: Merge System2 fields into existing rows
+  for (const row of rowsToUpsert) {
+    const { error } = await supabase
+      .from("cake_earnings_daily")
+      .update({
+        system2_revenue: row.system2_revenue,
+        clicks: row.clicks,
+        conversions: row.conversions,
+      })
+      .eq("cake_affiliate_id", row.cake_affiliate_id)
+      .eq("date", row.date);
 
-  console.log(`✔ Synced ${rowsToUpsert.length} SPK System2 rows`);
+    if (error) throw error;
+  }
+
+  console.log(`✔ Merged ${rowsToUpsert.length} SPK System2 rows`);
 }
 
 // ─────────────────────────────────────────────
