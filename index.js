@@ -56,12 +56,15 @@ function minDate(a, b) {
   return a < b ? a : b;
 }
 
-// SAFELY extract sub_id text from XML parser output
-function extractSubId(raw) {
-  if (!raw) return "";
-  if (typeof raw === "string") return raw.trim();
-  if (typeof raw === "object" && raw["#text"]) {
-    return String(raw["#text"]).trim();
+// normalize ANY xml node into string
+function normalizeText(v) {
+  if (v == null) return "";
+  if (typeof v === "string") return v.trim();
+  if (typeof v === "number") return String(v);
+  if (typeof v === "object") {
+    if (typeof v["#text"] === "string") return v["#text"].trim();
+    const values = Object.values(v);
+    if (values.length === 1) return normalizeText(values[0]);
   }
   return "";
 }
@@ -71,7 +74,13 @@ function extractSubId(raw) {
 // ─────────────────────────────────────────────
 async function run() {
   const totals = new Map();
-  const parser = new XMLParser();
+
+  const parser = new XMLParser({
+    ignoreAttributes: false,
+    trimValues: true,
+    parseTagValue: true,
+    parseAttributeValue: false,
+  });
 
   let cursor = new Date(START_DATE);
 
@@ -99,23 +108,27 @@ async function run() {
         `&row_limit=${ROW_LIMIT}`;
 
       const res = await fetch(url);
-      if (!res.ok) {
-        throw new Error(await res.text());
-      }
+      if (!res.ok) throw new Error(await res.text());
 
       const xml = await res.text();
       const parsed = parser.parse(xml);
 
-      const subs =
-        parsed?.sub_affiliate_summary_response?.data?.subaffiliate ?? [];
+      let rows =
+        parsed?.sub_affiliate_summary_response?.data?.subaffiliate;
 
-      const rows = Array.isArray(subs) ? subs : [subs];
+      if (!rows) break;
+
+      if (!Array.isArray(rows)) rows = [rows];
       if (!rows.length) break;
 
       for (const r of rows) {
-        const subId = extractSubId(r.sub_id);
+        const subId = normalizeText(r.sub_id);
 
-        if (!subId || !SPARK_ID_REGEX.test(subId)) continue;
+        if (!SPARK_ID_REGEX.test(subId)) continue;
+
+        const clicks = Number(r.clicks ?? 0);
+        const conversions = Number(r.conversions ?? 0);
+        const revenue = Number(r.revenue ?? 0);
 
         const prev = totals.get(subId) || {
           clicks: 0,
@@ -124,13 +137,12 @@ async function run() {
         };
 
         totals.set(subId, {
-          clicks: prev.clicks + Number(r.clicks ?? 0),
-          conversions: prev.conversions + Number(r.conversions ?? 0),
-          revenue: prev.revenue + Number(r.revenue ?? 0),
+          clicks: prev.clicks + clicks,
+          conversions: prev.conversions + conversions,
+          revenue: prev.revenue + revenue,
         });
       }
 
-      // pagination end condition
       if (rows.length < ROW_LIMIT) break;
       startAt += ROW_LIMIT;
     }
@@ -148,6 +160,8 @@ async function run() {
       cake_affiliate_id: sparkId,
       date: SNAPSHOT_DATE,
       system2_revenue: v.revenue,
+      clicks: v.clicks,
+      conversions: v.conversions,
     })
   );
 
