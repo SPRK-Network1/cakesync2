@@ -28,7 +28,7 @@ const supabase = createClient(
 // CONSTANTS
 // ─────────────────────────────────────────────
 const AFFILIATE_ID = "26142";
-const START_DATE = new Date("2025-12-01");
+const START_DATE = new Date("2026-01-10");
 const WINDOW_DAYS = 28;
 const SNAPSHOT_DATE = "2026-01-04";
 const ROW_LIMIT = 500;
