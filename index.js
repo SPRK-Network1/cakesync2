@@ -73,7 +73,6 @@ function normalizeText(v) {
 // ─────────────────────────────────────────────
 async function run() {
   const totals = new Map();
-  const seenSubIds = new Set(); // debug visibility
 
   const parser = new XMLParser({
     ignoreAttributes: false,
@@ -107,14 +106,22 @@ async function run() {
         `&row_limit=${ROW_LIMIT}` +
         `&format=xml`;
 
-      const res = await fetch(url);
-      if (!res.ok) throw new Error(await res.text());
+      const res = await fetch(url, {
+        headers: {
+          "User-Agent": "Mozilla/5.0 (compatible; SPRKNetworkBot/1.0)",
+          "Accept": "application/xml,text/xml;q=0.9,*/*;q=0.8",
+        },
+      });
+
+      if (!res.ok) {
+        throw new Error(await res.text());
+      }
 
       const xml = await res.text();
       const parsed = parser.parse(xml);
 
-      const root = parsed?.sub_affiliate_summary_response;
-      let rows = root?.data?.subaffiliate;
+      let rows =
+        parsed?.sub_affiliate_summary_response?.data?.subaffiliate;
 
       if (!rows) break;
       if (!Array.isArray(rows)) rows = [rows];
@@ -122,13 +129,6 @@ async function run() {
 
       for (const r of rows) {
         const subId = normalizeText(r.sub_id);
-
-        // debug: print first 25 unique sub_ids
-        if (subId && !seenSubIds.has(subId) && seenSubIds.size < 25) {
-          console.log("SEEN sub_id:", subId);
-          seenSubIds.add(subId);
-        }
-
         if (!SPARK_ID_REGEX.test(subId)) continue;
 
         const revenue = Number(r.revenue ?? 0);
