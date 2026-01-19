@@ -28,20 +28,36 @@ const supabase = createClient(
 // CONSTANTS
 // ─────────────────────────────────────────────
 const AFFILIATE_ID = "26142";
+const START_DATE = new Date("2026-01-10");
+const WINDOW_DAYS = 28;
 const ROW_LIMIT = 500;
 
-// MyMonetise REQUIRES these params even for summary
-const START_DATE = "2026-01-10"; // first known activity
-const END_DATE = new Date().toISOString().split("T")[0]; // today (UTC)
+const SPARK_ID_REGEX = /^SPK-[A-Z0-9]{4}-[A-Z0-9]{4}$/i;
+
+// yesterday only
+const today = new Date();
+today.setDate(today.getDate() - 1);
 
 // snapshot date = today
-const SNAPSHOT_DATE = END_DATE;
-
-const SPARK_ID_REGEX = /^SPK-[A-Z0-9]{4}-[A-Z0-9]{4}$/i;
+const SNAPSHOT_DATE = today.toISOString().split("T")[0];
 
 // ─────────────────────────────────────────────
 // HELPERS
 // ─────────────────────────────────────────────
+function toISO(d) {
+  return d.toISOString().split("T")[0];
+}
+
+function addDays(d, days) {
+  const x = new Date(d);
+  x.setDate(x.getDate() + days);
+  return x;
+}
+
+function minDate(a, b) {
+  return a < b ? a : b;
+}
+
 function normalizeText(v) {
   if (v == null) return "";
   if (typeof v === "string") return v.trim();
@@ -58,71 +74,112 @@ function normalizeText(v) {
 // MAIN
 // ─────────────────────────────────────────────
 async function run() {
+  const totals = new Map();
+  const seenSubIds = new Set(); // DEBUG
+
   const parser = new XMLParser({
     ignoreAttributes: false,
     trimValues: true,
     parseTagValue: true,
   });
 
-  const rowsToUpsert = [];
-  let startAt = 1;
+  let cursor = new Date(START_DATE);
 
-  while (true) {
-    const url =
-      "https://mymonetise.co.uk/affiliates/api/Reports/SubAffiliateSummary" +
-      `?api_key=${SYSTEM2_API_KEY}` +
-      `&affiliate_id=${AFFILIATE_ID}` +
-      `&start_date=${encodeURIComponent(START_DATE + " 00:00:00")}` +
-      `&end_date=${encodeURIComponent(END_DATE + " 23:59:59")}` +
-      `&start_at_row=${startAt}` +
-      `&row_limit=${ROW_LIMIT}`;
+  while (cursor <= today) {
+    const windowStart = new Date(cursor);
+    const windowEnd = minDate(
+      addDays(cursor, WINDOW_DAYS - 1),
+      today
+    );
 
-    const res = await fetch(url);
-    if (!res.ok) throw new Error(await res.text());
+    console.log(
+      `Fetching System2: ${toISO(windowStart)} → ${toISO(windowEnd)}`
+    );
 
-    const xml = await res.text();
-    const parsed = parser.parse(xml);
+    let startAt = 1;
 
-    let subs =
-      parsed?.sub_affiliate_summary_response?.data?.subaffiliate;
+    while (true) {
+      const url =
+        "https://mymonetise.co.uk/affiliates/api/Reports/SubAffiliateSummary" +
+        `?api_key=${SYSTEM2_API_KEY}` +
+        `&affiliate_id=${AFFILIATE_ID}` +
+        `&start_date=${encodeURIComponent(toISO(windowStart) + " 00:00:00")}` +
+        `&end_date=${encodeURIComponent(toISO(windowEnd) + " 23:59:59")}` +
+        `&start_at_row=${startAt}` +
+        `&row_limit=${ROW_LIMIT}`;
 
-    if (!subs) break;
-    if (!Array.isArray(subs)) subs = [subs];
-    if (!subs.length) break;
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(await res.text());
 
-    for (const r of subs) {
-      const subId = normalizeText(r.sub_id);
-      if (!SPARK_ID_REGEX.test(subId)) continue;
+      const xml = await res.text();
+      const parsed = parser.parse(xml);
 
-      rowsToUpsert.push({
-        cake_affiliate_id: subId,
-        date: SNAPSHOT_DATE,
-        system2_revenue: Number(r.revenue ?? 0),
-        clicks: Number(r.clicks ?? 0),
-        conversions: Number(r.conversions ?? 0),
-      });
+      let rows =
+        parsed?.sub_affiliate_summary_response?.data?.subaffiliate;
+
+      if (!rows) break;
+      if (!Array.isArray(rows)) rows = [rows];
+      if (!rows.length) break;
+
+      for (const r of rows) {
+        const subId = normalizeText(r.sub_id);
+
+        // 🔍 DEBUG: log first ~25 unique sub_ids
+        if (subId && !seenSubIds.has(subId) && seenSubIds.size < 25) {
+          console.log("SEEN sub_id:", subId);
+          seenSubIds.add(subId);
+        }
+
+        if (!SPARK_ID_REGEX.test(subId)) continue;
+
+        const clicks = Number(r.clicks ?? 0);
+        const conversions = Number(r.conversions ?? 0);
+        const revenue = Number(r.revenue ?? 0);
+
+        const prev = totals.get(subId) || {
+          clicks: 0,
+          conversions: 0,
+          revenue: 0,
+        };
+
+        totals.set(subId, {
+          clicks: prev.clicks + clicks,
+          conversions: prev.conversions + conversions,
+          revenue: prev.revenue + revenue,
+        });
+      }
+
+      if (rows.length < ROW_LIMIT) break;
+      startAt += ROW_LIMIT;
     }
 
-    if (subs.length < ROW_LIMIT) break;
-    startAt += ROW_LIMIT;
+    cursor = addDays(windowEnd, 1);
   }
 
-  if (!rowsToUpsert.length) {
-    console.log("No valid SPK rows found");
+  if (!totals.size) {
+    console.log("❌ No valid SPK rows found");
     return;
   }
 
+  const rows = Array.from(totals.entries()).map(
+    ([sparkId, v]) => ({
+      cake_affiliate_id: sparkId,
+      date: SNAPSHOT_DATE,
+      system2_revenue: v.revenue,
+      clicks: v.clicks,
+      conversions: v.conversions,
+    })
+  );
+
   const { error } = await supabase
     .from("cake_earnings_daily")
-    .upsert(rowsToUpsert, {
+    .upsert(rows, {
       onConflict: "cake_affiliate_id,date",
     });
 
   if (error) throw error;
 
-  console.log(
-    `✔ Updated ${rowsToUpsert.length} SPKs with latest System2 totals`
-  );
+  console.log(`✔ Synced ${rows.length} SPK System2 rows`);
 }
 
 // ─────────────────────────────────────────────
