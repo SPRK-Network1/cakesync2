@@ -56,6 +56,16 @@ function minDate(a, b) {
   return a < b ? a : b;
 }
 
+// SAFELY extract sub_id text from XML parser output
+function extractSubId(raw) {
+  if (!raw) return "";
+  if (typeof raw === "string") return raw.trim();
+  if (typeof raw === "object" && raw["#text"]) {
+    return String(raw["#text"]).trim();
+  }
+  return "";
+}
+
 // ─────────────────────────────────────────────
 // MAIN
 // ─────────────────────────────────────────────
@@ -100,11 +110,10 @@ async function run() {
         parsed?.sub_affiliate_summary_response?.data?.subaffiliate ?? [];
 
       const rows = Array.isArray(subs) ? subs : [subs];
-
       if (!rows.length) break;
 
       for (const r of rows) {
-        const subId = String(r.sub_id || "").trim();
+        const subId = extractSubId(r.sub_id);
 
         if (!subId || !SPARK_ID_REGEX.test(subId)) continue;
 
