@@ -30,10 +30,14 @@ const supabase = createClient(
 const AFFILIATE_ID = "26142";
 const ROW_LIMIT = 500;
 
-const SPARK_ID_REGEX = /^SPK-[A-Z0-9]{4}-[A-Z0-9]{4}$/i;
+// MyMonetise REQUIRES these params even for summary
+const START_DATE = "2026-01-10"; // first known activity
+const END_DATE = new Date().toISOString().split("T")[0]; // today (UTC)
 
-// snapshot date = today (UTC)
-const SNAPSHOT_DATE = new Date().toISOString().split("T")[0];
+// snapshot date = today
+const SNAPSHOT_DATE = END_DATE;
+
+const SPARK_ID_REGEX = /^SPK-[A-Z0-9]{4}-[A-Z0-9]{4}$/i;
 
 // ─────────────────────────────────────────────
 // HELPERS
@@ -60,7 +64,7 @@ async function run() {
     parseTagValue: true,
   });
 
-  const totals = [];
+  const rowsToUpsert = [];
   let startAt = 1;
 
   while (true) {
@@ -68,6 +72,8 @@ async function run() {
       "https://mymonetise.co.uk/affiliates/api/Reports/SubAffiliateSummary" +
       `?api_key=${SYSTEM2_API_KEY}` +
       `&affiliate_id=${AFFILIATE_ID}` +
+      `&start_date=${encodeURIComponent(START_DATE + " 00:00:00")}` +
+      `&end_date=${encodeURIComponent(END_DATE + " 23:59:59")}` +
       `&start_at_row=${startAt}` +
       `&row_limit=${ROW_LIMIT}`;
 
@@ -77,18 +83,18 @@ async function run() {
     const xml = await res.text();
     const parsed = parser.parse(xml);
 
-    let rows =
+    let subs =
       parsed?.sub_affiliate_summary_response?.data?.subaffiliate;
 
-    if (!rows) break;
-    if (!Array.isArray(rows)) rows = [rows];
-    if (!rows.length) break;
+    if (!subs) break;
+    if (!Array.isArray(subs)) subs = [subs];
+    if (!subs.length) break;
 
-    for (const r of rows) {
+    for (const r of subs) {
       const subId = normalizeText(r.sub_id);
       if (!SPARK_ID_REGEX.test(subId)) continue;
 
-      totals.push({
+      rowsToUpsert.push({
         cake_affiliate_id: subId,
         date: SNAPSHOT_DATE,
         system2_revenue: Number(r.revenue ?? 0),
@@ -97,24 +103,26 @@ async function run() {
       });
     }
 
-    if (rows.length < ROW_LIMIT) break;
+    if (subs.length < ROW_LIMIT) break;
     startAt += ROW_LIMIT;
   }
 
-  if (!totals.length) {
+  if (!rowsToUpsert.length) {
     console.log("No valid SPK rows found");
     return;
   }
 
   const { error } = await supabase
     .from("cake_earnings_daily")
-    .upsert(totals, {
+    .upsert(rowsToUpsert, {
       onConflict: "cake_affiliate_id,date",
     });
 
   if (error) throw error;
 
-  console.log(`✔ Updated ${totals.length} SPKs with latest System2 totals`);
+  console.log(
+    `✔ Updated ${rowsToUpsert.length} SPKs with latest System2 totals`
+  );
 }
 
 // ─────────────────────────────────────────────
