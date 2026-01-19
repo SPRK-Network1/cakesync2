@@ -1,16 +1,17 @@
 import fetch from "node-fetch";
 import { createClient } from "@supabase/supabase-js";
+import { XMLParser } from "fast-xml-parser";
 
 // ─────────────────────────────────────────────
 // ENV
 // ─────────────────────────────────────────────
 const {
-  CAKE_API_KEY,
+  SYSTEM2_API_KEY,
   SUPABASE_URL,
   SUPABASE_SERVICE_ROLE_KEY,
 } = process.env;
 
-if (!CAKE_API_KEY || !SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+if (!SYSTEM2_API_KEY || !SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
   throw new Error("Missing environment variables");
 }
 
@@ -26,14 +27,14 @@ const supabase = createClient(
 // ─────────────────────────────────────────────
 // CONSTANTS
 // ─────────────────────────────────────────────
-const AFFILIATE_ID = "208330";
+const AFFILIATE_ID = "26142";
 const START_DATE = new Date("2025-12-01");
 const WINDOW_DAYS = 28;
 const SNAPSHOT_DATE = "2026-01-04";
 
 const SPARK_ID_REGEX = /^SPK-[A-Z0-9]{4}-[A-Z0-9]{4}$/i;
 
-// yesterday only (CAKE completed data)
+// yesterday only (completed data)
 const today = new Date();
 today.setDate(today.getDate() - 1);
 
@@ -59,6 +60,7 @@ function minDate(a, b) {
 // ─────────────────────────────────────────────
 async function run() {
   const totals = new Map();
+  const parser = new XMLParser();
 
   let cursor = new Date(START_DATE);
 
@@ -70,42 +72,43 @@ async function run() {
     );
 
     const url =
-      "https://login.affluentco.com/affiliates/api/Reports/SubAffiliateSummary" +
-      `?api_key=${CAKE_API_KEY}` +
+      "https://mymonetise.co.uk/affiliates/api/Reports/SubAffiliateSummary" +
+      `?api_key=${SYSTEM2_API_KEY}` +
       `&affiliate_id=${AFFILIATE_ID}` +
-      `&start_date=${toISO(windowStart)}` +
-      `&end_date=${toISO(windowEnd)}` +
-      `&format=json`;
+      `&start_date=${encodeURIComponent(toISO(windowStart) + " 00:00:00")}` +
+      `&end_date=${encodeURIComponent(toISO(windowEnd) + " 23:59:59")}` +
+      `&start_at_row=1&row_limit=500`;
 
-    console.log(`Fetching CAKE: ${toISO(windowStart)} → ${toISO(windowEnd)}`);
+    console.log(`Fetching System2: ${toISO(windowStart)} → ${toISO(windowEnd)}`);
 
-    const res = await fetch(url, {
-      headers: { Accept: "application/json" },
-    });
-
+    const res = await fetch(url);
     if (!res.ok) {
       throw new Error(await res.text());
     }
 
-    const json = await res.json();
+    const xml = await res.text();
+    const parsed = parser.parse(xml);
 
-    for (const r of json.data || []) {
-      if (!r.sub_id || !SPARK_ID_REGEX.test(String(r.sub_id))) continue;
+    const subs =
+      parsed?.sub_affiliate_summary_response?.data?.subaffiliate ?? [];
 
-      const key = String(r.sub_id);
+    const rows = Array.isArray(subs) ? subs : [subs];
 
-      const prev = totals.get(key) || {
+    for (const r of rows) {
+      const subId = String(r.sub_id || "").trim();
+
+      if (!subId || !SPARK_ID_REGEX.test(subId)) continue;
+
+      const prev = totals.get(subId) || {
         clicks: 0,
         conversions: 0,
         revenue: 0,
-        payout: 0,
       };
 
-      totals.set(key, {
+      totals.set(subId, {
         clicks: prev.clicks + Number(r.clicks ?? 0),
         conversions: prev.conversions + Number(r.conversions ?? 0),
         revenue: prev.revenue + Number(r.revenue ?? 0),
-        payout: prev.payout + Number(r.events ?? 0),
       });
     }
 
@@ -113,7 +116,7 @@ async function run() {
   }
 
   if (!totals.size) {
-    console.log("No SPK rows found at all");
+    console.log("No valid SPK rows found");
     return;
   }
 
@@ -121,10 +124,10 @@ async function run() {
     ([sparkId, v]) => ({
       cake_affiliate_id: sparkId,
       date: SNAPSHOT_DATE,
-      clicks: v.clicks,
-      conversions: v.conversions,
-      revenue: v.revenue,
-      payout: v.payout,
+      system2_revenue: v.revenue,
+      // OPTIONAL: uncomment if you want these stored too
+      // clicks: v.clicks,
+      // conversions: v.conversions,
     })
   );
 
@@ -136,7 +139,7 @@ async function run() {
 
   if (error) throw error;
 
-  console.log(`✔ Synced ${rows.length} SPK lifetime rows`);
+  console.log(`✔ Synced ${rows.length} SPK System2 rows`);
 }
 
 run()
@@ -145,4 +148,3 @@ run()
     console.error("❌ Sync failed:", err);
     process.exit(1);
   });
-
