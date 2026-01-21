@@ -28,15 +28,16 @@ const supabase = createClient(
 // CONSTANTS
 // ─────────────────────────────────────────────
 const AFFILIATE_ID = "26142";
-const START_DATE = new Date("2026-01-10");
+const START_DATE = new Date("2026-01-10"); // first known System2 data
 const WINDOW_DAYS = 28;
 const ROW_LIMIT = 500;
 
 const SPARK_ID_REGEX = /^SPK-[A-Z0-9]{4}-[A-Z0-9]{4}$/i;
 
-// yesterday (stable totals)
+// snapshot date = yesterday (stable totals for completed day)
 const today = new Date();
 today.setDate(today.getDate() - 1);
+const SNAPSHOT_DATE = today.toISOString().split("T")[0];
 
 // ─────────────────────────────────────────────
 // HELPERS
@@ -81,17 +82,11 @@ async function run() {
 
   let cursor = new Date(START_DATE);
 
-  // ───── Fetch & aggregate System2 ─────
   while (cursor <= today) {
     const windowStart = new Date(cursor);
-    const windowEnd = minDate(
-      addDays(cursor, WINDOW_DAYS - 1),
-      today
-    );
+    const windowEnd = minDate(addDays(cursor, WINDOW_DAYS - 1), today);
 
-    console.log(
-      `Fetching System2: ${toISO(windowStart)} → ${toISO(windowEnd)}`
-    );
+    console.log(`Fetching System2: ${toISO(windowStart)} → ${toISO(windowEnd)}`);
 
     let startAt = 1;
 
@@ -118,27 +113,23 @@ async function run() {
       const xml = await res.text();
       const parsed = parser.parse(xml);
 
-      let rows =
-        parsed?.sub_affiliate_summary_response?.data?.subaffiliate;
+      let rows = parsed?.sub_affiliate_summary_response?.data?.subaffiliate;
 
       if (!rows) break;
       if (!Array.isArray(rows)) rows = [rows];
+      if (!rows.length) break;
 
       for (const r of rows) {
-        const spkCode = normalizeText(r.sub_id);
-        if (!SPARK_ID_REGEX.test(spkCode)) continue;
+        const subId = normalizeText(r.sub_id);
+        if (!SPARK_ID_REGEX.test(subId)) continue;
 
         const revenue = Number(r.revenue ?? 0);
         const clicks = Number(r.clicks ?? 0);
         const conversions = Number(r.conversions ?? 0);
 
-        const prev = totals.get(spkCode) || {
-          revenue: 0,
-          clicks: 0,
-          conversions: 0,
-        };
+        const prev = totals.get(subId) || { revenue: 0, clicks: 0, conversions: 0 };
 
-        totals.set(spkCode, {
+        totals.set(subId, {
           revenue: prev.revenue + revenue,
           clicks: prev.clicks + clicks,
           conversions: prev.conversions + conversions,
@@ -153,58 +144,29 @@ async function run() {
   }
 
   if (!totals.size) {
-    console.log("❌ No valid SPKs found");
+    console.log("❌ No valid SPK rows found");
     return;
   }
 
-  // ───── Merge into canonical sparks table ─────
-  for (const [spkCode, v] of totals.entries()) {
-    // 1️⃣ Fetch existing spark
-    const { data: existing, error: fetchError } = await supabase
-      .from("sparks")
-      .select(
-        "id, system2_revenue, system2_clicks, system2_conversions"
-      )
-      .eq("spk_code", spkCode)
-      .maybeSingle();
+  // Build ONE row per SPK for the snapshot date.
+  // Upsert will update existing row instead of creating duplicates.
+  const rowsToUpsert = Array.from(totals.entries()).map(([sparkId, v]) => ({
+    cake_affiliate_id: sparkId,
+    date: SNAPSHOT_DATE,
+    system2_revenue: v.revenue,
+    clicks: v.clicks,
+    conversions: v.conversions,
+  }));
 
-    if (fetchError) throw fetchError;
+  const { error } = await supabase
+    .from("cake_earnings_daily")
+    .upsert(rowsToUpsert, {
+      onConflict: "cake_affiliate_id,date",
+    });
 
-    // 2️⃣ Update if exists
-    if (existing) {
-      const { error: updateError } = await supabase
-        .from("sparks")
-        .update({
-          system2_revenue:
-            Number(existing.system2_revenue || 0) + v.revenue,
-          system2_clicks:
-            Number(existing.system2_clicks || 0) + v.clicks,
-          system2_conversions:
-            Number(existing.system2_conversions || 0) + v.conversions,
-        })
-        .eq("id", existing.id);
+  if (error) throw error;
 
-      if (updateError) throw updateError;
-    } 
-    // 3️⃣ Insert if missing
-    else {
-      const { error: insertError } = await supabase
-        .from("sparks")
-        .insert({
-          spk_code: spkCode,
-          system2_revenue: v.revenue,
-          system2_clicks: v.clicks,
-          system2_conversions: v.conversions,
-        });
-
-      // Ignore duplicate race conditions
-      if (insertError && insertError.code !== "23505") {
-        throw insertError;
-      }
-    }
-  }
-
-  console.log(`✔ Updated ${totals.size} SPKs with System2 data`);
+  console.log(`✔ Upserted ${rowsToUpsert.length} SPK System2 rows into cake_earnings_daily for ${SNAPSHOT_DATE}`);
 }
 
 // ─────────────────────────────────────────────
@@ -212,7 +174,7 @@ async function run() {
 // ─────────────────────────────────────────────
 run()
   .then(() => process.exit(0))
-  .catch(err => {
+  .catch((err) => {
     console.error("❌ Sync failed:", err);
     process.exit(1);
   });
