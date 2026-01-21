@@ -34,7 +34,7 @@ const ROW_LIMIT = 500;
 
 const SPARK_ID_REGEX = /^SPK-[A-Z0-9]{4}-[A-Z0-9]{4}$/i;
 
-// snapshot date = yesterday (stable totals)
+// yesterday (stable totals)
 const today = new Date();
 today.setDate(today.getDate() - 1);
 
@@ -81,6 +81,7 @@ async function run() {
 
   let cursor = new Date(START_DATE);
 
+  // ───── Fetch & aggregate System2 ─────
   while (cursor <= today) {
     const windowStart = new Date(cursor);
     const windowEnd = minDate(
@@ -112,9 +113,7 @@ async function run() {
         },
       });
 
-      if (!res.ok) {
-        throw new Error(await res.text());
-      }
+      if (!res.ok) throw new Error(await res.text());
 
       const xml = await res.text();
       const parsed = parser.parse(xml);
@@ -124,7 +123,6 @@ async function run() {
 
       if (!rows) break;
       if (!Array.isArray(rows)) rows = [rows];
-      if (!rows.length) break;
 
       for (const r of rows) {
         const spkCode = normalizeText(r.sub_id);
@@ -155,36 +153,41 @@ async function run() {
   }
 
   if (!totals.size) {
-    console.log("❌ No valid SPK rows found");
+    console.log("❌ No valid SPKs found");
     return;
   }
 
-  // ─────────────────────────────────────────────
-  // SYSTEM2 → SPARK MERGE (CANONICAL + SAFE)
-  // ─────────────────────────────────────────────
-
+  // ───── Merge into canonical sparks table ─────
   for (const [spkCode, v] of totals.entries()) {
-    // 1️⃣ Try increment existing spark
-    const { data: updated, error: updateError } = await supabase
+    // 1️⃣ Fetch existing spark
+    const { data: existing, error: fetchError } = await supabase
       .from("sparks")
-      .update({
-        system2_revenue: supabase.sql`
-          COALESCE(system2_revenue, 0) + ${v.revenue}
-        `,
-        system2_clicks: supabase.sql`
-          COALESCE(system2_clicks, 0) + ${v.clicks}
-        `,
-        system2_conversions: supabase.sql`
-          COALESCE(system2_conversions, 0) + ${v.conversions}
-        `,
-      })
+      .select(
+        "id, system2_revenue, system2_clicks, system2_conversions"
+      )
       .eq("spk_code", spkCode)
-      .select("id");
+      .maybeSingle();
 
-    if (updateError) throw updateError;
+    if (fetchError) throw fetchError;
 
-    // 2️⃣ If spark does not exist, create once
-    if (!updated || updated.length === 0) {
+    // 2️⃣ Update if exists
+    if (existing) {
+      const { error: updateError } = await supabase
+        .from("sparks")
+        .update({
+          system2_revenue:
+            Number(existing.system2_revenue || 0) + v.revenue,
+          system2_clicks:
+            Number(existing.system2_clicks || 0) + v.clicks,
+          system2_conversions:
+            Number(existing.system2_conversions || 0) + v.conversions,
+        })
+        .eq("id", existing.id);
+
+      if (updateError) throw updateError;
+    } 
+    // 3️⃣ Insert if missing
+    else {
       const { error: insertError } = await supabase
         .from("sparks")
         .insert({
@@ -194,7 +197,7 @@ async function run() {
           system2_conversions: v.conversions,
         });
 
-      // Ignore duplicate insert race conditions
+      // Ignore duplicate race conditions
       if (insertError && insertError.code !== "23505") {
         throw insertError;
       }
