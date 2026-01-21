@@ -28,7 +28,7 @@ const supabase = createClient(
 // CONSTANTS
 // ─────────────────────────────────────────────
 const AFFILIATE_ID = "26142";
-const START_DATE = new Date("2026-01-10"); // first known System2 data
+const START_DATE = new Date("2026-01-10");
 const WINDOW_DAYS = 28;
 const ROW_LIMIT = 500;
 
@@ -37,7 +37,6 @@ const SPARK_ID_REGEX = /^SPK-[A-Z0-9]{4}-[A-Z0-9]{4}$/i;
 // snapshot date = yesterday (stable totals)
 const today = new Date();
 today.setDate(today.getDate() - 1);
-const SNAPSHOT_DATE = today.toISOString().split("T")[0];
 
 // ─────────────────────────────────────────────
 // HELPERS
@@ -109,7 +108,7 @@ async function run() {
       const res = await fetch(url, {
         headers: {
           "User-Agent": "Mozilla/5.0 (compatible; SPRKNetworkBot/1.0)",
-          "Accept": "application/xml,text/xml;q=0.9,*/*;q=0.8",
+          Accept: "application/xml,text/xml;q=0.9,*/*;q=0.8",
         },
       });
 
@@ -128,20 +127,20 @@ async function run() {
       if (!rows.length) break;
 
       for (const r of rows) {
-        const subId = normalizeText(r.sub_id);
-        if (!SPARK_ID_REGEX.test(subId)) continue;
+        const spkCode = normalizeText(r.sub_id);
+        if (!SPARK_ID_REGEX.test(spkCode)) continue;
 
         const revenue = Number(r.revenue ?? 0);
         const clicks = Number(r.clicks ?? 0);
         const conversions = Number(r.conversions ?? 0);
 
-        const prev = totals.get(subId) || {
+        const prev = totals.get(spkCode) || {
           revenue: 0,
           clicks: 0,
           conversions: 0,
         };
 
-        totals.set(subId, {
+        totals.set(spkCode, {
           revenue: prev.revenue + revenue,
           clicks: prev.clicks + clicks,
           conversions: prev.conversions + conversions,
@@ -160,47 +159,49 @@ async function run() {
     return;
   }
 
-  const rowsToUpsert = Array.from(totals.entries()).map(
-    ([sparkId, v]) => ({
-      cake_affiliate_id: sparkId,
-      date: SNAPSHOT_DATE,
-      system2_revenue: v.revenue,
-      clicks: v.clicks,
-      conversions: v.conversions,
-    })
-  );
-
   // ─────────────────────────────────────────────
-  // MERGE FIX (ONLY CHANGE)
+  // SYSTEM2 → SPARK MERGE (CANONICAL + SAFE)
   // ─────────────────────────────────────────────
 
-  // Step 1: Ensure row exists (insert if missing)
-  await supabase
-    .from("cake_earnings_daily")
-    .upsert(
-      rowsToUpsert.map(r => ({
-        cake_affiliate_id: r.cake_affiliate_id,
-        date: r.date,
-      })),
-      { onConflict: "cake_affiliate_id,date" }
-    );
-
-  // Step 2: Merge System2 fields into existing rows
-  for (const row of rowsToUpsert) {
-    const { error } = await supabase
-      .from("cake_earnings_daily")
+  for (const [spkCode, v] of totals.entries()) {
+    // 1️⃣ Try increment existing spark
+    const { data: updated, error: updateError } = await supabase
+      .from("sparks")
       .update({
-        system2_revenue: row.system2_revenue,
-        clicks: row.clicks,
-        conversions: row.conversions,
+        system2_revenue: supabase.sql`
+          COALESCE(system2_revenue, 0) + ${v.revenue}
+        `,
+        system2_clicks: supabase.sql`
+          COALESCE(system2_clicks, 0) + ${v.clicks}
+        `,
+        system2_conversions: supabase.sql`
+          COALESCE(system2_conversions, 0) + ${v.conversions}
+        `,
       })
-      .eq("cake_affiliate_id", row.cake_affiliate_id)
-      .eq("date", row.date);
+      .eq("spk_code", spkCode)
+      .select("id");
 
-    if (error) throw error;
+    if (updateError) throw updateError;
+
+    // 2️⃣ If spark does not exist, create once
+    if (!updated || updated.length === 0) {
+      const { error: insertError } = await supabase
+        .from("sparks")
+        .insert({
+          spk_code: spkCode,
+          system2_revenue: v.revenue,
+          system2_clicks: v.clicks,
+          system2_conversions: v.conversions,
+        });
+
+      // Ignore duplicate insert race conditions
+      if (insertError && insertError.code !== "23505") {
+        throw insertError;
+      }
+    }
   }
 
-  console.log(`✔ Merged ${rowsToUpsert.length} SPK System2 rows`);
+  console.log(`✔ Updated ${totals.size} SPKs with System2 data`);
 }
 
 // ─────────────────────────────────────────────
