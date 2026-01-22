@@ -5,6 +5,7 @@
   "dependencies": {
     "@supabase/supabase-js": "^2.39.5",
     "fast-xml-parser": "^5.3.3",
+    "luxon": "^3.4.4",
     "node-fetch": "^3.3.2"
   }
 }

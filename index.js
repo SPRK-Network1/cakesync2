@@ -1,6 +1,7 @@
 import fetch from "node-fetch";
 import { createClient } from "@supabase/supabase-js";
 import { XMLParser } from "fast-xml-parser";
+import { DateTime } from "luxon";
 
 // ─────────────────────────────────────────────
 // ENV
@@ -28,34 +29,21 @@ const supabase = createClient(
 // CONSTANTS
 // ─────────────────────────────────────────────
 const AFFILIATE_ID = "26142";
-const START_DATE = new Date("2026-01-10"); // first known System2 data
+const TIME_ZONE = "America/New_York";
+const START_DATE = DateTime.fromISO("2026-01-10", { zone: TIME_ZONE }).startOf("day"); // first known System2 data
 const WINDOW_DAYS = 28;
 const ROW_LIMIT = 500;
 
 const SPARK_ID_REGEX = /^SPK-[A-Z0-9]{4}-[A-Z0-9]{4}$/i;
 
-// snapshot date = yesterday (stable totals for completed day)
-const today = new Date();
-today.setDate(today.getDate() - 1);
-const SNAPSHOT_DATE = today.toISOString().split("T")[0];
+// snapshot date = current EST day (API is GMT)
+const nowEst = DateTime.now().setZone(TIME_ZONE);
+const END_DATE = nowEst.endOf("day");
+const SNAPSHOT_DATE = nowEst.toISODate();
 
 // ─────────────────────────────────────────────
 // HELPERS
 // ─────────────────────────────────────────────
-function toISO(d) {
-  return d.toISOString().split("T")[0];
-}
-
-function addDays(d, days) {
-  const x = new Date(d);
-  x.setDate(x.getDate() + days);
-  return x;
-}
-
-function minDate(a, b) {
-  return a < b ? a : b;
-}
-
 function normalizeText(v) {
   if (v == null) return "";
   if (typeof v === "string") return v.trim();
@@ -80,13 +68,16 @@ async function run() {
     parseTagValue: true,
   });
 
-  let cursor = new Date(START_DATE);
+  let cursor = START_DATE;
 
-  while (cursor <= today) {
-    const windowStart = new Date(cursor);
-    const windowEnd = minDate(addDays(cursor, WINDOW_DAYS - 1), today);
+  while (cursor <= END_DATE) {
+    const windowStart = cursor.startOf("day");
+    const windowEnd = DateTime.min(cursor.plus({ days: WINDOW_DAYS - 1 }).endOf("day"), END_DATE);
 
-    console.log(`Fetching System2: ${toISO(windowStart)} → ${toISO(windowEnd)}`);
+    const windowStartUtc = windowStart.toUTC();
+    const windowEndUtc = windowEnd.toUTC();
+
+    console.log(`Fetching System2 (EST days, GMT request): ${windowStart.toISODate()} → ${windowEnd.toISODate()}`);
 
     let startAt = 1;
 
@@ -95,8 +86,8 @@ async function run() {
         "https://mymonetise.co.uk/affiliates/api/Reports/SubAffiliateSummary" +
         `?api_key=${SYSTEM2_API_KEY}` +
         `&affiliate_id=${AFFILIATE_ID}` +
-        `&start_date=${encodeURIComponent(toISO(windowStart) + " 00:00:00")}` +
-        `&end_date=${encodeURIComponent(toISO(windowEnd) + " 23:59:59")}` +
+        `&start_date=${encodeURIComponent(windowStartUtc.toFormat("yyyy-LL-dd HH:mm:ss"))}` +
+        `&end_date=${encodeURIComponent(windowEndUtc.toFormat("yyyy-LL-dd HH:mm:ss"))}` +
         `&start_at_row=${startAt}` +
         `&row_limit=${ROW_LIMIT}` +
         `&format=xml`;
@@ -140,7 +131,7 @@ async function run() {
       startAt += ROW_LIMIT;
     }
 
-    cursor = addDays(windowEnd, 1);
+    cursor = windowEnd.plus({ days: 1 }).startOf("day");
   }
 
   if (!totals.size) {
@@ -158,15 +149,42 @@ async function run() {
     conversions: v.conversions,
   }));
 
-  const { error } = await supabase
+  // Check which Spark codes already exist; only create new rows for the missing ones.
+  const sparkIds = Array.from(totals.keys());
+  const { data: existingRows, error: fetchExistingError } = await supabase
     .from("cake_earnings_daily")
-    .upsert(rowsToUpsert, {
-      onConflict: "cake_affiliate_id,date",
-    });
+    .select("cake_affiliate_id")
+    .in("cake_affiliate_id", sparkIds);
 
-  if (error) throw error;
+  if (fetchExistingError) throw fetchExistingError;
 
-  console.log(`✔ Upserted ${rowsToUpsert.length} SPK System2 rows into cake_earnings_daily for ${SNAPSHOT_DATE}`);
+  const existingSet = new Set((existingRows || []).map((r) => r.cake_affiliate_id));
+  const existingRowsToUpsert = rowsToUpsert.filter((r) => existingSet.has(r.cake_affiliate_id));
+  const newRowsToInsert = rowsToUpsert.filter((r) => !existingSet.has(r.cake_affiliate_id));
+
+  if (existingRowsToUpsert.length) {
+    const { error } = await supabase
+      .from("cake_earnings_daily")
+      .upsert(existingRowsToUpsert, {
+        onConflict: "cake_affiliate_id,date",
+      });
+
+    if (error) throw error;
+  }
+
+  if (newRowsToInsert.length) {
+    const { error } = await supabase
+      .from("cake_earnings_daily")
+      .upsert(newRowsToInsert, {
+        onConflict: "cake_affiliate_id,date",
+      });
+
+    if (error) throw error;
+  }
+
+  console.log(
+    `✔ Upserted ${existingRowsToUpsert.length} existing SPK rows, inserted ${newRowsToInsert.length} new SPK rows into cake_earnings_daily for ${SNAPSHOT_DATE}`
+  );
 }
 
 // ─────────────────────────────────────────────
