@@ -30,16 +30,20 @@ const supabase = createClient(
 // ─────────────────────────────────────────────
 const AFFILIATE_ID = "26142";
 const TIME_ZONE = "America/New_York";
-const START_DATE = DateTime.fromISO("2026-01-10", { zone: TIME_ZONE }).startOf("day"); // first known System2 data
+const START_DATE = DateTime.fromISO("2026-01-10", { zone: TIME_ZONE }).startOf("day");
 const WINDOW_DAYS = 28;
 const ROW_LIMIT = 500;
 
 const SPARK_ID_REGEX = /^SPK-[A-Z0-9]{4}-[A-Z0-9]{4}$/i;
 
-// snapshot date = current EST day (API is GMT)
+// ─────────────────────────────────────────────
+// 🔒 LOCKED SNAPSHOT DATE (UPDATES EVERY HOUR)
+// ─────────────────────────────────────────────
+const SNAPSHOT_DATE = "2026-01-04";
+
+// API still uses rolling time windows
 const nowEst = DateTime.now().setZone(TIME_ZONE);
 const END_DATE = nowEst.endOf("day");
-const SNAPSHOT_DATE = nowEst.toISODate();
 
 // ─────────────────────────────────────────────
 // HELPERS
@@ -72,12 +76,17 @@ async function run() {
 
   while (cursor <= END_DATE) {
     const windowStart = cursor.startOf("day");
-    const windowEnd = DateTime.min(cursor.plus({ days: WINDOW_DAYS - 1 }).endOf("day"), END_DATE);
+    const windowEnd = DateTime.min(
+      cursor.plus({ days: WINDOW_DAYS - 1 }).endOf("day"),
+      END_DATE
+    );
 
     const windowStartUtc = windowStart.toUTC();
     const windowEndUtc = windowEnd.toUTC();
 
-    console.log(`Fetching System2 (EST days, GMT request): ${windowStart.toISODate()} → ${windowEnd.toISODate()}`);
+    console.log(
+      `Fetching System2 (EST days, GMT request): ${windowStart.toISODate()} → ${windowEnd.toISODate()}`
+    );
 
     let startAt = 1;
 
@@ -139,8 +148,7 @@ async function run() {
     return;
   }
 
-  // Build ONE row per SPK for the snapshot date.
-  // Upsert will update existing row instead of creating duplicates.
+  // Build ONE row per SPK for the LOCKED snapshot date
   const rowsToUpsert = Array.from(totals.entries()).map(([sparkId, v]) => ({
     cake_affiliate_id: sparkId,
     date: SNAPSHOT_DATE,
@@ -149,8 +157,8 @@ async function run() {
     conversions: v.conversions,
   }));
 
-  // Check which Spark codes already exist; only create new rows for the missing ones.
   const sparkIds = Array.from(totals.keys());
+
   const { data: existingRows, error: fetchExistingError } = await supabase
     .from("cake_earnings_daily")
     .select("cake_affiliate_id")
@@ -159,8 +167,14 @@ async function run() {
   if (fetchExistingError) throw fetchExistingError;
 
   const existingSet = new Set((existingRows || []).map((r) => r.cake_affiliate_id));
-  const existingRowsToUpsert = rowsToUpsert.filter((r) => existingSet.has(r.cake_affiliate_id));
-  const newRowsToInsert = rowsToUpsert.filter((r) => !existingSet.has(r.cake_affiliate_id));
+
+  const existingRowsToUpsert = rowsToUpsert.filter((r) =>
+    existingSet.has(r.cake_affiliate_id)
+  );
+
+  const newRowsToInsert = rowsToUpsert.filter(
+    (r) => !existingSet.has(r.cake_affiliate_id)
+  );
 
   if (existingRowsToUpsert.length) {
     const { error } = await supabase
